@@ -1,8 +1,5 @@
 fastapi
-uvicorn[standard]
-python-multipart
+uvicorn
 pdfplumber
-python-docx
-openai
 pydantic
-gunicord
+python-multipart

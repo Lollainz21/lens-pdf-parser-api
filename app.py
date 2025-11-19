@@ -1,107 +1,129 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import os
+import io
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
 import pdfplumber
 import docx
-import tempfile
 import openai
-import os
-import json
-from typing import Dict
+
+# Legge la chiave dalle variabili di ambiente (Render)
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI()
 
-# Allow Lovable origin or '*' for testing (tighten in prod)
+# CORS aperto, così puoi chiamarlo dal frontend senza problemi
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST","OPTIONS","GET"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Set OPENAI_API_KEY environment variable")
 
-openai.api_key = OPENAI_API_KEY
-
-def extract_text_from_pdf(path: str) -> str:
-    text = ""
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
-
-def extract_text_from_docx(path: str) -> str:
-    doc = docx.Document(path)
-    return "\n".join([p.text for p in doc.paragraphs if p.text])
-
-def clean_text(t: str) -> str:
-    # semplice pulizia, puoi migliorare
-    return " ".join(t.split())
-
-async def call_openai_extract_structured(text: str) -> Dict:
-    # Prompt per OpenAI per restituire JSON strutturato
-    system = "You are an expert HR parser. Return valid JSON with fields: name, contact, summary, hard_skills[], soft_skills[], experience[{company, role, start, end, desc}], education[], certifications[], languages[], raw_text_preview (first 400 chars)."
-    user = f"Extract structured CV data from the text below. Text:\n\n{text}"
-
-    resp = openai.ChatCompletion.create(
-        model="gpt-4o-mini",  # o un modello che hai accesso
-        messages=[
-            {"role":"system","content":system},
-            {"role":"user","content":user}
-        ],
-        temperature=0.0,
-        max_tokens=1000,
-    )
-    content = resp.choices[0].message["content"]
-    # Try to parse JSON out of the response
+def extract_text_from_pdf(file_bytes: bytes) -> str:
     try:
-        # in molti casi GPT restituisce JSON direttamente
-        parsed = json.loads(content)
-        return parsed
-    except Exception:
-        # Se non è JSON pulito, tenta di estrarre l'ultima porzione JSON
-        import re
-        m = re.search(r'(\{.*\})', content, re.S)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except:
-                pass
-        # fallback: restituisci testo grezzo in payload
-        return {"error":"could_not_parse_json","raw_output": content, "raw_text_preview": text[:400]}
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            pages_text = []
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                pages_text.append(text)
+        text = "\n".join(pages_text).strip()
+        if not text:
+            raise ValueError("Nessun testo leggibile trovato nel PDF.")
+        return text
+    except Exception as e:
+        raise ValueError(f"Errore durante la lettura del PDF: {e}")
+
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    try:
+        document = docx.Document(io.BytesIO(file_bytes))
+        text = "\n".join(p.text for p in document.paragraphs).strip()
+        if not text:
+            raise ValueError("Nessun testo leggibile trovato nel DOCX.")
+        return text
+    except Exception as e:
+        raise ValueError(f"Errore durante la lettura del DOCX: {e}")
+
+
+def summarize_with_openai(text: str) -> str:
+    """
+    Usa OpenAI per fare un breve riassunto del CV.
+    Se qualcosa va storto, solleva un'eccezione e ci pensa l'endpoint a gestirla.
+    """
+    # Taglio il testo per sicurezza, così non mando cose infinite
+    truncated = text[:15000]
+
+    prompt = (
+        "Sei un assistente HR. Leggi il seguente CV e produci un breve riassunto "
+        "in massimo 10 bullet point, mettendo in evidenza ruolo attuale, anni di esperienza, "
+        "stack tecnologico principale e soft skills più rilevanti.\n\n"
+        f"CV:\n{truncated}"
+    )
+
+    response = openai.ChatCompletion.create(
+        model="gpt-4o-mini",  # se vuoi puoi cambiare modello
+        messages=[
+            {"role": "system", "content": "Sei un esperto HR che analizza CV."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+
+    return response.choices[0].message["content"].strip()
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Lens CV parser API online"}
+
 
 @app.post("/parse")
 async def parse_cv(file: UploadFile = File(...)):
-    if not file:
-        raise HTTPException(status_code=400, detail="No file uploaded")
+    """
+    Endpoint principale:
+    - accetta PDF o DOCX
+    - estrae il testo
+    - prova a generare un riassunto con OpenAI
+    - restituisce sempre il testo; il riassunto può essere None se OpenAI fallisce
+    """
+    filename = file.filename.lower()
 
-    suffix = file.filename.lower().split('.')[-1]
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix="."+suffix)
-    content = await file.read()
-    tmp.write(content)
-    tmp.flush()
-    tmp.close()
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="File vuoto.")
 
+    # Parse del file
     try:
-        if suffix == "pdf":
-            raw = extract_text_from_pdf(tmp.name)
-        elif suffix in ("docx","doc"):
-            raw = extract_text_from_docx(tmp.name)
-        elif suffix == "txt":
-            raw = content.decode('utf-8', errors='ignore')
+        if filename.endswith(".pdf"):
+            extracted_text = extract_text_from_pdf(file_bytes)
+        elif filename.endswith(".docx") or filename.endswith(".doc"):
+            extracted_text = extract_text_from_docx(file_bytes)
         else:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
+            raise HTTPException(
+                status_code=400,
+                detail="Formato non supportato. Carica un file PDF o DOCX.",
+            )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        raise HTTPException(
+            status_code=500, detail="Errore imprevisto durante il parsing del file."
+        )
+
+    # Prova a riassumere con OpenAI, ma senza bloccare tutto se fallisce
+    summary = None
+    try:
+        summary = summarize_with_openai(extracted_text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+        # Qui potresti loggare e basta; non buttiamo giù l'API per colpa di OpenAI
+        print(f"Errore durante il riassunto con OpenAI: {e}")
 
-    cleaned = clean_text(raw)
-    if len(cleaned.strip()) < 20:
-        raise HTTPException(status_code=400, detail="Extracted text too short or empty")
-
-    # call OpenAI to structure the CV
-    structured = await call_openai_extract_structured(cleaned)
-
-    return {"filename": file.filename, "text": cleaned, "structured": structured}
+    return {
+        "filename": file.filename,
+        "text": extracted_text,
+        "summary": summary,
+    }

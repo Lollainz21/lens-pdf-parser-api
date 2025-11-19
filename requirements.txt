@@ -4,3 +4,4 @@ pdfplumber
 pydantic
 python-multipart
 python-docx
+openai==0.28.0

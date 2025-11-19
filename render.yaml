@@ -1,7 +1,7 @@
 services:
-- type: web
-  name: lens-pdf-parser
-  env: python
-  buildCommand: pip install -r requirements.txt
-  startCommand: uvicorn app:app --host 0.0.0.0 --port 10000
-  plan: free
+  - type: web
+    name: lens-cv-parser
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
